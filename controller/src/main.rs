@@ -22,7 +22,7 @@ fn main() -> opencv::Result<()> {
             continue;
         }
 
-        if frame.empty()? {
+        if frame.empty() {
             // No data yet
             thread::sleep(Duration::from_millis(10));
             continue;

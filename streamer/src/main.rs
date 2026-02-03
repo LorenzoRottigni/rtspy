@@ -4,6 +4,8 @@ use gstreamer_app::AppSrc;
 use gstreamer_rtsp_server::prelude::*;
 use gstreamer_rtsp_server::{RTSPMediaFactory, RTSPServer};
 use gstreamer_video::{VideoFormat, VideoInfo};
+use opencv::core::{Point, Scalar};
+use opencv::imgproc;
 use opencv::{prelude::*, videoio};
 use std::thread;
 use std::time::Duration;
@@ -42,10 +44,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let mut frame = Mat::default();
             if cam.read(&mut frame).unwrap() && !frame.empty() {
+                // Get current timestamp
+                let now = chrono::Local::now();
+                let timestamp = now.format("%Y-%m-%d %H:%M:%S").to_string();
+
+                // Overlay timestamp on frame
+                imgproc::put_text(
+                    &mut frame,
+                    &timestamp,         // text
+                    Point::new(10, 30), // position
+                    imgproc::FONT_HERSHEY_SIMPLEX,
+                    1.0,                               // font scale
+                    Scalar::new(0.0, 255.0, 0.0, 0.0), // color (green)
+                    2,                                 // thickness
+                    imgproc::LINE_AA,
+                    false, // bottom-left origin
+                )
+                .unwrap();
+
                 // Convert to raw bytes for sending
                 let bytes = frame.data_bytes().unwrap().to_vec();
                 if tx.send(bytes).is_err() {
-                    break;
+                    break; // receiver dropped
                 }
             } else {
                 thread::sleep(Duration::from_millis(10));
