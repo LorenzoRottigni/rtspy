@@ -1,5 +1,5 @@
 [package]
-name = "rtspi-guard-streamer"
+name = "rtspy-streamer"
 version = "0.1.0"
 edition = "2024"
 

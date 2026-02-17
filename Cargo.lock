@@ -872,14 +872,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
 
 [[package]]
-name = "rtspi-guard-controller"
+name = "rtspy-controller"
 version = "0.1.0"
 dependencies = [
  "opencv",
 ]
 
 [[package]]
-name = "rtspi-guard-streamer"
+name = "rtspy-streamer"
 version = "0.1.0"
 dependencies = [
  "chrono",
