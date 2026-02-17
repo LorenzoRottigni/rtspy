@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "streamer",
-    "controller"
+    "controller",
+    "worker"
 ]
