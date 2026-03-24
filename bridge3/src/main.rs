@@ -9,6 +9,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 
@@ -17,6 +18,7 @@ const RTSP_URL: &str = "rtsp://127.0.0.1:8554/live";
 struct Bridge {
     pipeline: gst::Pipeline,
     webrtcbin: gst::Element,
+    bus_quit: Arc<AtomicBool>,
 }
 
 impl Bridge {
@@ -24,6 +26,7 @@ impl Bridge {
         gst::init()?;
 
         let pipeline: gst::Pipeline = gst::Pipeline::new();
+        let bus_quit = Arc::new(AtomicBool::new(false));
 
         // RTSP source
         let rtspsrc: gst::Element = gst::ElementFactory::make("rtspsrc")
@@ -97,10 +100,12 @@ impl Bridge {
         Ok(Self {
             pipeline,
             webrtcbin,
+            bus_quit,
         })
     }
 
     async fn start(&self) -> Result<String> {
+        self.start_bus_logger();
         let (tx, rx) = oneshot::channel::<String>();
         let tx = Arc::new(Mutex::new(Some(tx)));
         let wb = Arc::new(self.webrtcbin.clone());
@@ -137,11 +142,18 @@ impl Bridge {
                 None
             });
 
-        self.pipeline
+        let set_state_res = self
+            .pipeline
             .set_state(gst::State::Playing)
             .context("Failed to set pipeline to Playing")?;
-        if let Some(details) = self.pipeline_error() {
-            return Err(anyhow!("Pipeline error: {details}"));
+        let (state_res, current, pending) = self.pipeline.state(gst::ClockTime::from_seconds(3));
+        if state_res.is_err() {
+            let details = self
+                .pipeline_error()
+                .unwrap_or_else(|| "unknown".to_string());
+            return Err(anyhow!(
+                "Pipeline failed to reach Playing. set_state={set_state_res:?}, current={current:?}, pending={pending:?}, details={details}"
+            ));
         }
 
         Ok(rx.await.context("Never got SDP offer")?)
@@ -173,6 +185,7 @@ impl Bridge {
     }
 
     fn stop(&self) {
+        self.bus_quit.store(true, Ordering::Relaxed);
         self.pipeline.set_state(gst::State::Null).ok();
     }
 
@@ -187,6 +200,53 @@ impl Bridge {
             }
         }
         None
+    }
+
+    fn start_bus_logger(&self) {
+        let bus = match self.pipeline.bus() {
+            Some(bus) => bus,
+            None => return,
+        };
+        let quit = self.bus_quit.clone();
+
+        std::thread::spawn(move || {
+            while !quit.load(Ordering::Relaxed) {
+                if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(200)) {
+                    use gst::MessageView;
+                    match msg.view() {
+                        MessageView::Error(err) => {
+                            let debug = err.debug().unwrap_or_default();
+                            eprintln!(
+                                "GST error from {:?}: {} {}",
+                                err.src().map(|s| s.path_string()),
+                                err.error(),
+                                debug
+                            );
+                        }
+                        MessageView::Warning(warn) => {
+                            let debug = warn.debug().unwrap_or_default();
+                            eprintln!(
+                                "GST warning from {:?}: {} {}",
+                                warn.src().map(|s| s.path_string()),
+                                warn.error(),
+                                debug
+                            );
+                        }
+                        MessageView::StateChanged(state) => {
+                            if let Some(src) = msg.src() {
+                                let name = src.path_string();
+                                eprintln!(
+                                    "State changed ({name}): {:?} -> {:?}",
+                                    state.old(),
+                                    state.current()
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
     }
 }
 
