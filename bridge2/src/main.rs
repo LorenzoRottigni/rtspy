@@ -1,17 +1,16 @@
-// bridge/src/main.rs
 use anyhow::{Context, Result};
 use axum::{
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
     routing::get,
     Router,
 };
+use futures::StreamExt;
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_rtsp::RTSPLowerTrans;
 use gstreamer_sdp as gst_sdp;
 use gstreamer_webrtc as gst_webrtc;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 const RTSP_URL: &str = "rtsp://127.0.0.1:8554/live";
 
@@ -24,51 +23,43 @@ struct Bridge {
 impl Bridge {
     fn new() -> Result<Self> {
         gst::init()?;
-
-        // Create pipeline elements manually
         let pipeline = gst::Pipeline::new();
 
+        // RTSP source
         let rtspsrc = gst::ElementFactory::make("rtspsrc").build()?;
         rtspsrc.set_property("location", RTSP_URL);
-        rtspsrc.set_property("latency", 0u32);
-        rtspsrc.set_property("protocols", RTSPLowerTrans::TCP);
+        rtspsrc.set_property("latency", 200u32);
+        rtspsrc.set_property_from_str("protocols", "tcp");
 
+        // H264 depay + pay
         let depay = gst::ElementFactory::make("rtph264depay").build()?;
-        let parse = gst::ElementFactory::make("h264parse").build()?;
         let pay = gst::ElementFactory::make("rtph264pay").build()?;
-        pay.set_property("config-interval", -1i32); // send SPS/PPS periodically
-        pay.set_property_from_str("aggregate-mode", "zero-latency");
+        pay.set_property("config-interval", -1i32);
 
+        // WebRTC
         let webrtcbin = gst::ElementFactory::make("webrtcbin").build()?;
         webrtcbin.set_property_from_str("bundle-policy", "max-bundle");
 
-        pipeline.add_many(&[&rtspsrc, &depay, &parse, &pay, &webrtcbin])?;
-        gst::Element::link_many(&[&depay, &parse, &pay])?;
+        // Add elements
+        pipeline.add_many(&[&rtspsrc, &depay, &pay, &webrtcbin])?;
+        gst::Element::link_many(&[&depay, &pay])?;
 
-        // connect rtspsrc pad-added dynamically
+        // rtspsrc dynamic pad -> depay
         let depay_clone = depay.clone();
         rtspsrc.connect_pad_added(move |_, src_pad| {
             let sink_pad = depay_clone.static_pad("sink").unwrap();
-            if sink_pad.is_linked() {
-                return;
+            if !sink_pad.is_linked() {
+                src_pad.link(&sink_pad).unwrap();
             }
-            src_pad.link(&sink_pad).unwrap();
         });
 
-        // link pay -> webrtcbin via request pad
+        // pay -> webrtcbin dynamic pad
         let webrtc_clone = webrtcbin.clone();
-        pay.connect_pad_added(move |pay, src_pad| {
-            // request a send_rtp_sink pad on webrtcbin
-            let pad_name = "send_rtp_sink_0"; // first video stream
-            let webrtc_sink = webrtc_clone
-                .request_pad_simple(pad_name)
-                .expect("failed to request webrtcbin pad");
-            src_pad
-                .link(&webrtc_sink)
-                .expect("failed to link pay -> webrtcbin");
+        pay.connect_pad_added(move |_, src_pad| {
+            if let Some(sink_pad) = webrtc_clone.request_pad_simple("send_rtp_sink_0") {
+                src_pad.link(&sink_pad).unwrap();
+            }
         });
-
-        pipeline.add(&rtspsrc)?;
 
         Ok(Self {
             pipeline,
@@ -79,16 +70,15 @@ impl Bridge {
 
     async fn start(&self) -> Result<String> {
         let (tx, rx) = tokio::sync::oneshot::channel::<String>();
-        let tx = Arc::new(std::sync::Mutex::new(Some(tx)));
-
-        let wb = self.webrtcbin.clone();
-        let tx2 = tx.clone();
+        let tx = Arc::new(Mutex::new(Some(tx)));
+        let wb_arc = Arc::new(self.webrtcbin.clone());
+        let tx_arc = tx.clone();
 
         self.webrtcbin
             .connect("on-negotiation-needed", false, move |_| {
-                let tx2 = tx2.clone();
-                let wb_inner = wb.clone();
-                let wb_offer = wb.clone();
+                let wb_clone = wb_arc.clone();
+                let wb_clone_2 = wb_clone.clone();
+                let tx_clone = tx_arc.clone();
 
                 let promise = gst::Promise::with_change_func(move |reply| {
                     let reply = reply.unwrap().unwrap();
@@ -97,21 +87,23 @@ impl Bridge {
                         .unwrap()
                         .get::<gst_webrtc::WebRTCSessionDescription>()
                         .unwrap();
-                    wb_inner.emit_by_name::<()>(
+
+                    wb_clone.clone().emit_by_name::<()>(
                         "set-local-description",
                         &[&offer, &None::<gst::Promise>],
                     );
+
                     let sdp = offer.sdp().as_text().unwrap();
-                    if let Some(tx) = tx2.lock().unwrap().take() {
-                        let _ = tx.send(sdp);
+                    if let Some(sender) = tx_clone.blocking_lock().take() {
+                        let _ = sender.send(sdp);
                     }
                 });
-                wb_offer.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
+
+                wb_clone_2.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
                 None
             });
 
         self.pipeline.set_state(gst::State::Playing)?;
-
         let sdp = rx.await.context("never got SDP offer")?;
         Ok(sdp)
     }
@@ -146,14 +138,7 @@ impl Bridge {
 }
 
 async fn handle_ws(mut socket: WebSocket) {
-    let bridge = Arc::new(match Bridge::new() {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Bridge init failed: {e}");
-            return;
-        }
-    });
-
+    let bridge = Arc::new(Bridge::new().unwrap());
     let (ice_tx, mut ice_rx) = mpsc::channel::<String>(32);
 
     bridge.on_ice_candidate({
@@ -169,53 +154,31 @@ async fn handle_ws(mut socket: WebSocket) {
         }
     });
 
-    let offer_sdp = match bridge.start().await {
-        Ok(sdp) => sdp,
-        Err(e) => {
-            eprintln!("Bridge start failed: {e}");
-            return;
-        }
-    };
-
+    let offer_sdp = bridge.start().await.unwrap();
     let offer_msg = serde_json::json!({ "type": "offer", "sdp": offer_sdp }).to_string();
-    if socket.send(Message::Text(offer_msg)).await.is_err() {
-        return;
-    }
+    socket.send(Message::Text(offer_msg)).await.unwrap();
 
-    loop {
-        tokio::select! {
-            Some(ice) = ice_rx.recv() => {
-                if socket.send(Message::Text(ice)).await.is_err() {
-                    break;
-                }
-            }
-            msg = socket.recv() => {
-                match msg {
-                    Some(Ok(Message::Text(txt))) => {
-                        let v: serde_json::Value = match serde_json::from_str(&txt) {
-                            Ok(v) => v,
-                            Err(_) => continue,
-                        };
-                        match v["type"].as_str() {
-                            Some("answer") => {
-                                if let Some(sdp) = v["sdp"].as_str() {
-                                    bridge.set_answer(sdp).ok();
-                                }
-                            }
-                            Some("ice") => {
-                                if let (Some(mline), Some(candidate)) = (
-                                    v["mlineIndex"].as_u64(),
-                                    v["candidate"].as_str(),
-                                ) {
-                                    bridge.add_ice_candidate(mline as u32, candidate);
-                                }
-                            }
-                            _ => {}
+    while let Some(msg) = socket.recv().await {
+        match msg {
+            Ok(Message::Text(txt)) => {
+                let v: serde_json::Value = serde_json::from_str(&txt).unwrap_or_default();
+                match v["type"].as_str() {
+                    Some("answer") => {
+                        if let Some(sdp) = v["sdp"].as_str() {
+                            bridge.set_answer(sdp).ok();
                         }
                     }
-                    _ => break,
+                    Some("ice") => {
+                        if let (Some(mline), Some(candidate)) =
+                            (v["mlineIndex"].as_u64(), v["candidate"].as_str())
+                        {
+                            bridge.add_ice_candidate(mline as u32, candidate);
+                        }
+                    }
+                    _ => {}
                 }
             }
+            _ => break,
         }
     }
 

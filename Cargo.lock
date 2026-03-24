@@ -1627,6 +1627,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "rtspy-bridge3"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "futures",
+ "glib 0.21.5",
+ "gstreamer 0.24.4",
+ "gstreamer-rtp",
+ "gstreamer-rtsp",
+ "gstreamer-sdp",
+ "gstreamer-webrtc",
+ "hyper",
+ "serde",
+ "serde_json",
+ "tokio",
+ "warp",
+]
+
+[[package]]
 name = "rtspy-controller"
 version = "0.1.0"
 dependencies = [

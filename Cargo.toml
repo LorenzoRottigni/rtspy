@@ -5,4 +5,5 @@ members = [
     "worker",
     "bridge",
     "bridge2",
+    "bridge3",
 ]
