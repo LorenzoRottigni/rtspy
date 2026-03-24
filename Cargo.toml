@@ -2,5 +2,7 @@
 members = [
     "streamer",
     "controller",
-    "worker"
+    "worker",
+    "bridge",
+    "bridge2",
 ]
